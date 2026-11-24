@@ -86,6 +86,95 @@
       </form>
     </div>
 
+    <section v-if="meta.key === 'snapshot_mgr'" class="recovery-panel" data-testid="snapshot-recovery-panel">
+      <h3>快照恢复数据包（异地恢复离线载体）</h3>
+      <p class="page-desc">
+        导出指定版本快照的分区数据，包含来源表、快照版本、分区对象及 SHA-256 内容摘要，
+        同一版本重复导出内容一致，可交异地作业离线恢复。
+      </p>
+      <form class="filter-bar" @submit.prevent="handleBuildPackage">
+        <label class="filter-item">
+          <span>快照行ID</span>
+          <input v-model="packageForm.snapshotRowId" data-testid="package-row-id" required />
+        </label>
+        <label class="filter-item">
+          <span>快照版本</span>
+          <input v-model="packageForm.snapshotVersion" data-testid="package-version" required />
+        </label>
+        <button class="btn primary" type="submit" data-testid="build-package">生成数据包</button>
+        <button class="btn" type="button" data-testid="download-package" @click="handleDownloadPackage">
+          下载离线载体
+        </button>
+      </form>
+      <table v-if="recoveryPackages.length" class="data-table">
+        <thead>
+          <tr><th>包摘要</th><th>来源表</th><th>快照</th><th>版本</th><th>分区对象</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in recoveryPackages" :key="item.package_digest">
+            <td>{{ item.package_digest.slice(0, 12) }}…</td>
+            <td>{{ item.source_table }}</td>
+            <td>{{ item.snapshot_id }}</td>
+            <td>{{ item.snapshot_version }}</td>
+            <td>{{ item.partitions.join('、') }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section v-if="meta.key === 'table_catalog'" class="recovery-panel" data-testid="catalog-recovery-panel">
+      <h3>异地快照恢复（带回执）</h3>
+      <p class="page-desc">
+        表目录同步读取恢复数据包，从目标恢复作业创建可核验分区。逐分区发布核验通过即生效；
+        整批确认需全部预期分区核验通过后一起发布。摘要不符的对象不可读、不记成功，可补送修复。
+      </p>
+      <form class="filter-bar" @submit.prevent="handleStartRecovery">
+        <label class="filter-item">
+          <span>同步记录ID</span>
+          <input v-model="recoveryForm.catalogRowId" data-testid="recovery-row-id" required />
+        </label>
+        <label class="filter-item">
+          <span>数据包摘要</span>
+          <input v-model="recoveryForm.packageDigest" data-testid="recovery-package-digest" required />
+        </label>
+        <label class="filter-item">
+          <span>原有无关分区</span>
+          <input v-model="recoveryForm.preexisting" data-testid="recovery-preexisting" placeholder="如 p3" />
+        </label>
+        <label class="filter-item">
+          <span>发布边界</span>
+          <select v-model="recoveryForm.boundary" data-testid="recovery-boundary">
+            <option value="partition">逐分区发布</option>
+            <option value="batch">整批确认</option>
+          </select>
+        </label>
+        <button class="btn primary" type="submit" data-testid="start-recovery">发起异地恢复</button>
+        <button class="btn" type="button" data-testid="load-partitions" @click="handleLoadPartitions">
+          重开目标表核对
+        </button>
+      </form>
+      <div v-if="lastReceipt" class="receipt-card" data-testid="recovery-receipt">
+        <strong>回执：{{ lastReceipt.ok ? '全部生效' : '存在待补齐对象' }}</strong>
+        <p>发布边界：{{ lastReceipt.publish_boundary }} ｜ 作业：{{ lastReceipt.job_id }} ｜ 状态：{{ lastReceipt.job_status }}</p>
+        <p>已生效：{{ (lastReceipt.effective_partitions || []).join('、') || '无' }}</p>
+        <p>待补：{{ (lastReceipt.pending_partitions || []).join('、') || '无' }}</p>
+        <p v-if="lastReceipt.note" class="error-text">{{ lastReceipt.note }}</p>
+      </div>
+      <table v-if="readablePartitions.length" class="data-table">
+        <thead>
+          <tr><th>可读分区</th><th>来源</th><th>快照</th><th>已发布</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="part in readablePartitions" :key="part.partition">
+            <td>{{ part.partition }}</td>
+            <td>{{ part.source }}</td>
+            <td>{{ part.snapshot_id }}</td>
+            <td>{{ part.published ? '是' : '否' }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -94,14 +183,24 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 
 import {
+  buildRecoveryPackage,
   createEntry,
   downloadEntries,
+  downloadRecoveryPackage,
+  getReadablePartitions,
   listEntries,
+  listRecoveryPackages,
   moduleMeta,
   runAction as applyAction,
+  startDisasterRecovery,
+} from '@/api/backend-service'
+import type {
+  RecoveryPackageSummary,
+  RecoveryReceipt,
+  ReadablePartition,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
 
@@ -187,5 +286,88 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+// ---------------------------------------------------------------------------
+// 快照恢复数据包 / 异地恢复面板
+// ---------------------------------------------------------------------------
+
+const packageForm = reactive({ snapshotRowId: '1', snapshotVersion: 'v1' })
+const recoveryPackages = ref<RecoveryPackageSummary[]>([])
+const recoveryForm = reactive({
+  catalogRowId: '1',
+  packageDigest: '',
+  preexisting: 'p3',
+  boundary: 'partition',
+})
+const lastReceipt = ref<RecoveryReceipt | null>(null)
+const readablePartitions = ref<ReadablePartition[]>([])
+
+async function refreshPackages() {
+  try {
+    const payload = await listRecoveryPackages()
+    recoveryPackages.value = payload.items
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '数据包读取失败'
+  }
+}
+
+async function handleBuildPackage() {
+  errorMessage.value = ''
+  try {
+    await buildRecoveryPackage(
+      Number(packageForm.snapshotRowId),
+      packageForm.snapshotVersion,
+    )
+    await refreshPackages()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '数据包生成失败'
+  }
+}
+
+async function handleDownloadPackage() {
+  errorMessage.value = ''
+  try {
+    await downloadRecoveryPackage(
+      Number(packageForm.snapshotRowId),
+      packageForm.snapshotVersion,
+    )
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '数据包下载失败'
+  }
+}
+
+async function handleStartRecovery() {
+  errorMessage.value = ''
+  try {
+    const preexisting = recoveryForm.preexisting
+      .split(/[，,、\s]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+    lastReceipt.value = await startDisasterRecovery(
+      Number(recoveryForm.catalogRowId),
+      {
+        publish_boundary: recoveryForm.boundary,
+        package_digest: recoveryForm.packageDigest,
+        preexisting_partitions: preexisting,
+      },
+    )
+    readablePartitions.value = lastReceipt.value.readable_partitions ?? []
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '异地恢复发起失败'
+  }
+}
+
+async function handleLoadPartitions() {
+  errorMessage.value = ''
+  try {
+    const view = await getReadablePartitions(Number(recoveryForm.catalogRowId))
+    readablePartitions.value = view.partitions
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '可读分区读取失败'
+  }
+}
+
+onMounted(() => {
+  void reload()
+  if (meta.key === 'snapshot_mgr') void refreshPackages()
+})
 </script>
